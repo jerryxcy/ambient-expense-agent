@@ -6,7 +6,8 @@ import base64
 import json
 import logging
 import os
-from typing import Any, Literal
+import re
+from typing import Any, Literal, TypeVar
 
 from google import genai
 from google.adk.agents.context import Context
@@ -15,15 +16,28 @@ from google.adk.events.event import Event
 from google.adk.events.request_input import RequestInput
 from google.adk.workflow import Workflow, node
 from google.genai import types
+from pydantic import BaseModel
 
 from . import config
 from .models import Expense, ExpenseOutcome, ExpenseReview, RiskAssessment
+from .security import detect_prompt_injection, scrub_pii
 
 logger = logging.getLogger(__name__)
+
+ModelT = TypeVar("ModelT", bound=BaseModel)
 
 
 def _extract_expense_dict(raw_input: Any) -> dict[str, Any]:
     """Extracts and normalizes expense data from raw JSON, Pub/Sub, or Content objects."""
+    if raw_input is None:
+        return {
+            "amount": 0.0,
+            "submitter": "anonymous_user",
+            "category": "General",
+            "description": "None",
+            "date": "2026-09-26",
+        }
+
     payload = raw_input
 
     # 1. Handle types.Content from START node in CLI/Runner sessions
@@ -90,87 +104,218 @@ def _get_genai_client() -> genai.Client:
     return genai.Client()
 
 
+_NEGATED_APPROVAL = re.compile(
+    r"\b(not|don'?t|never|cannot|can'?t|won'?t)\s+(be\s+)?(approv|ok\b|okay\b|good\b|fine\b)", re.IGNORECASE
+)
+_REJECT_WORDS = re.compile(r"\b(reject(ed)?|den(y|ied)|declin(e|ed)|disapprov(e|ed))\b", re.IGNORECASE)
+_LEADING_NO = re.compile(r"^\s*(no|nope)\b", re.IGNORECASE)
+# "approval" is deliberately excluded: "needs approval" is not an approval.
+_APPROVE_WORDS = re.compile(r"\b(approve[ds]?|yes|lgtm|ok(ay)?)\b", re.IGNORECASE)
+
+
+def _classify_decision(text: str) -> Literal["APPROVED", "REJECTED"] | None:
+    """Classifies free text as an approval or rejection; None when it is ambiguous."""
+    if _NEGATED_APPROVAL.search(text) or _REJECT_WORDS.search(text) or _LEADING_NO.search(text):
+        return "REJECTED"
+    if _APPROVE_WORDS.search(text):
+        return "APPROVED"
+    return None
+
+
 def _parse_human_decision(response: Any) -> tuple[Literal["APPROVED", "REJECTED"], str]:
-    """Parses a human response into an approval decision and approver notes."""
+    """Parses a human response into an approval decision and approver notes.
+
+    Fails closed: a response with no clear approval is treated as a rejection.
+    """
     if isinstance(response, dict):
-        decision = str(response.get("decision", response.get("status", ""))).upper()
+        decision_text = str(response.get("decision", response.get("status", "")))
         notes = str(response.get("notes", response.get("comment", response.get("reason", ""))))
-        if any(kw in decision for kw in ("REJECT", "DENY", "DISAPPROVE")):
-            return "REJECTED", notes
-        return "APPROVED", notes
+    else:
+        decision_text = str(response).strip()
+        notes = decision_text
 
-    resp_str = str(response).strip().lower()
-    if any(kw in resp_str for kw in ("reject", "deny", "declined", "disapproved", "no")):
-        return "REJECTED", str(response)
-    return "APPROVED", str(response)
+    decision = _classify_decision(decision_text)
+    if decision is None:
+        logger.warning("Ambiguous approver response %r; rejecting by default", decision_text)
+        return "REJECTED", f"[Ambiguous response, rejected by default] {notes}".strip()
+    return decision, notes
+
+
+def _resolve_input(node_input: Any, ctx: Context | None, model: type[ModelT], *state_keys: str) -> ModelT:
+    """Coerces node input into `model`, falling back to ctx.state on resume/replay.
+
+    Raises instead of fabricating a default, so missing data can never turn into an approval.
+    """
+    if isinstance(node_input, model):
+        return node_input
+    if isinstance(node_input, dict):
+        return model.model_validate(node_input)
+    if ctx is not None:
+        for key in state_keys:
+            if key in ctx.state:
+                return model.model_validate(ctx.state[key])
+    raise ValueError(
+        f"No {model.__name__} available from node input or session state keys {state_keys}"
+    )
+
+
+def _scrub_expense(expense: Expense) -> Expense:
+    """Returns a copy of the expense with PII removed from its description."""
+    sanitized_description, categories = scrub_pii(expense.description)
+    merged = list(dict.fromkeys([*expense.redacted_categories, *categories]))
+    return expense.model_copy(
+        update={"description": sanitized_description, "redacted_categories": merged}
+    )
 
 
 # ------------------------------------------------------------------------------
-# Workflow Graph Nodes
+# Workflow Graph Functions (Auto-wrapped by ADK into FunctionNodes)
 # ------------------------------------------------------------------------------
 
-@node(name="parse_expense")
-def parse_expense(node_input: Any) -> Expense:
-    """Pulls out the expense fields from raw JSON/Pub/Sub payloads."""
+def parse_expense(node_input: Any, ctx: Context | None = None) -> Event:
+    """Pulls out expense fields, handles replay/resume, and caches to ctx.state.
+
+    PII is scrubbed here, before anything is written to session state or logs.
+    """
+    if node_input is None and ctx and "expense" in ctx.state:
+        expense = Expense.model_validate(ctx.state["expense"])
+        return Event(output=expense)
+
     expense_data = _extract_expense_dict(node_input)
-    expense = Expense.model_validate(expense_data)
+    expense = _scrub_expense(Expense.model_validate(expense_data))
     logger.info(
         "Parsed expense: Submitter=%s, Amount=$%.2f, Category=%s",
         expense.submitter,
         expense.amount,
         expense.category,
     )
-    return expense
+    state = {"expense": expense.model_dump()} if ctx else None
+    return Event(output=expense, state=state)
 
 
-@node(name="route_expense")
-def route_expense(node_input: Expense) -> Event:
+def route_expense(node_input: Any, ctx: Context | None = None) -> Event:
     """Evaluates the dollar threshold rule in Python and routes accordingly.
 
     - Under $100 -> 'auto_approve'
     - $100 or more -> 'requires_review'
     """
-    if node_input.amount < config.AUTO_APPROVE_THRESHOLD:
+    expense = _resolve_input(node_input, ctx, Expense, "expense")
+
+    if expense.amount < config.AUTO_APPROVE_THRESHOLD:
         logger.info(
             "Expense $%.2f is below threshold $%.2f -> auto_approve",
-            node_input.amount,
+            expense.amount,
             config.AUTO_APPROVE_THRESHOLD,
         )
-        return Event(output=node_input, route="auto_approve")
+        return Event(output=expense, route="auto_approve")
 
     logger.info(
         "Expense $%.2f is at or above threshold $%.2f -> requires_review",
-        node_input.amount,
+        expense.amount,
         config.AUTO_APPROVE_THRESHOLD,
     )
-    return Event(output=node_input, route="requires_review")
+    return Event(output=expense, route="requires_review")
 
 
-@node(name="auto_approve")
-def auto_approve(node_input: Expense) -> ExpenseOutcome:
+def auto_approve(node_input: Any, ctx: Context | None = None) -> Event:
     """Instantly auto-approves expenses under the threshold without LLM intervention."""
-    return ExpenseOutcome(
-        expense=node_input,
+    expense = _resolve_input(node_input, ctx, Expense, "expense")
+
+    outcome = ExpenseOutcome(
+        expense=expense,
         status="APPROVED",
         reason=(
-            f"Auto-approved instantly: amount ${node_input.amount:.2f} is under the "
+            f"Auto-approved instantly: amount ${expense.amount:.2f} is under the "
             f"${config.AUTO_APPROVE_THRESHOLD:.2f} approval threshold."
         ),
         reviewed_by="auto_approval_rule",
         risk_alert=None,
     )
+    state = {"outcome": outcome.model_dump()} if ctx else None
+    return Event(output=outcome, state=state)
 
 
-@node(name="review_risk")
-async def review_risk(node_input: Expense) -> ExpenseReview:
-    """Calls Gemini to review risk factors and formulate an alert when amount >= threshold."""
+def security_checkpoint(node_input: Any, ctx: Context | None = None) -> Event:
+    """Security Checkpoint before the LLM reviewer.
+
+    1. Scrubs personal data (SSNs and credit cards) from description to ensure
+       PII never reaches the model, logs, or downstream payloads.
+    2. Detects prompt injection attempts aiming to force auto-approval or bypass rules.
+       If detected, bypasses the LLM reviewer and routes straight to human approval.
+    """
+    expense = _resolve_input(node_input, ctx, Expense, "expense")
+
+    # 1. Scrub PII from description (idempotent if parse_expense already did it)
+    sanitized_expense = _scrub_expense(expense)
+
+    if sanitized_expense.redacted_categories:
+        logger.info(
+            "PII redacted for submitter %s: %s",
+            expense.submitter,
+            ", ".join(sanitized_expense.redacted_categories),
+        )
+
+    # 2. Defend against prompt injection in every free-text field that reaches the LLM prompt
+    matched_patterns: list[str] = []
+    for text in (expense.submitter, expense.category, expense.date, expense.description):
+        _, field_patterns = detect_prompt_injection(text)
+        matched_patterns.extend(p for p in field_patterns if p not in matched_patterns)
+    is_injection = bool(matched_patterns)
+
+    if is_injection:
+        logger.warning(
+            "SECURITY EVENT DETECTED: Prompt injection attempt from submitter %s (patterns: %s). Bypassing LLM.",
+            expense.submitter,
+            ", ".join(matched_patterns),
+        )
+        flagged_expense = sanitized_expense.model_copy(update={"is_security_event": True})
+        security_assessment = RiskAssessment(
+            risk_level="HIGH",
+            risk_factors=[
+                "PROMPT_INJECTION_DETECTED",
+                f"Suspicious instruction patterns: {', '.join(matched_patterns)}",
+            ],
+            alert_summary=(
+                "SECURITY EVENT: The expense payload contains adversarial instructions attempting to "
+                "force auto-approval or bypass approval rules. LLM review was bypassed to prevent model manipulation."
+            ),
+            recommended_action="REJECT",
+            is_security_event=True,
+        )
+        security_review = ExpenseReview(
+            expense=flagged_expense,
+            risk_assessment=security_assessment,
+        )
+        # Route straight to human approval, model never sees it
+        return Event(
+            output=security_review,
+            route="security_alert",
+            state={"review": security_review.model_dump(), "sanitized_expense": flagged_expense.model_dump()},
+        )
+
+    # Clean expense continues on to the LLM reviewer
+    logger.info("Security checkpoint passed cleanly for expense $%.2f", sanitized_expense.amount)
+    return Event(
+        output=sanitized_expense,
+        route="clean",
+        state={"sanitized_expense": sanitized_expense.model_dump()},
+    )
+
+
+async def review_risk(node_input: Any, ctx: Context | None = None) -> Event:
+    """Calls Gemini to review risk factors and formulate an alert when amount >= threshold.
+
+    Receives the sanitized expense from security_checkpoint.
+    """
+    expense = _resolve_input(node_input, ctx, Expense, "sanitized_expense", "expense")
+
     prompt = (
         f"You are an enterprise expense auditor. Evaluate this expense report for risk factors:\n"
-        f"- Submitter: {node_input.submitter}\n"
-        f"- Amount: ${node_input.amount:.2f}\n"
-        f"- Category: {node_input.category}\n"
-        f"- Date: {node_input.date}\n"
-        f"- Description: {node_input.description}\n\n"
+        f"- Submitter: {expense.submitter}\n"
+        f"- Amount: ${expense.amount:.2f}\n"
+        f"- Category: {expense.category}\n"
+        f"- Date: {expense.date}\n"
+        f"- Description: {expense.description}\n\n"
         f"Assess potential risk factors (e.g. unusually high amounts for the category, vague justifications, "
         f"policy concerns, or weekend dates). Return a structured risk assessment."
     )
@@ -188,47 +333,63 @@ async def review_risk(node_input: Expense) -> ExpenseReview:
         )
         risk_assessment = RiskAssessment.model_validate_json(response.text)
     except Exception as exc:
-        logger.warning("LLM risk review call encountered an error (%s); falling back to rule-based review", exc)
+        logger.warning(
+            "LLM risk review call encountered an error (%s); falling back to rule-based review",
+            exc,
+        )
         risk_assessment = RiskAssessment(
-            risk_level="MEDIUM" if node_input.amount < 500 else "HIGH",
+            risk_level="MEDIUM" if expense.amount < 500 else "HIGH",
             risk_factors=[
-                f"Amount ${node_input.amount:.2f} exceeds standard ${config.AUTO_APPROVE_THRESHOLD:.2f} limit",
+                f"Amount ${expense.amount:.2f} exceeds standard ${config.AUTO_APPROVE_THRESHOLD:.2f} limit",
                 "Automated risk check flagged for human review",
             ],
             alert_summary=(
-                f"Expense of ${node_input.amount:.2f} by {node_input.submitter} for '{node_input.description}' "
+                f"Expense of ${expense.amount:.2f} by {expense.submitter} for '{expense.description}' "
                 f"exceeds the ${config.AUTO_APPROVE_THRESHOLD:.2f} threshold and requires manager review."
             ),
-            recommended_action="APPROVE" if node_input.amount < 500 else "REQUEST_MORE_INFO",
+            recommended_action="APPROVE" if expense.amount < 500 else "REQUEST_MORE_INFO",
         )
 
     logger.info("Risk review completed with level: %s", risk_assessment.risk_level)
-    return ExpenseReview(expense=node_input, risk_assessment=risk_assessment)
+    review = ExpenseReview(expense=expense, risk_assessment=risk_assessment)
+    return Event(output=review, state={"review": review.model_dump()})
 
 
-@node(name="human_approval", rerun_on_resume=True)
-async def human_approval(ctx: Context, node_input: ExpenseReview):
-    """Pauses workflow via RequestInput for human sign-off, then records decision upon resumption."""
+async def human_approval(ctx: Context, node_input: Any):
+    """Pauses workflow via RequestInput for human sign-off, then records decision upon resumption.
+
+    Receives ExpenseReview either from review_risk (clean path) or from security_checkpoint (security_alert path).
+    """
+    review = _resolve_input(node_input, ctx, ExpenseReview, "review")
+
     interrupt_id = config.APPROVAL_INTERRUPT_ID
 
     # Initial run: pause workflow and request approval decision
     if not ctx.resume_inputs or interrupt_id not in ctx.resume_inputs:
-        exp = node_input.expense
-        risk = node_input.risk_assessment
+        exp = review.expense
+        risk = review.risk_assessment
         factors = "\n  - " + "\n  - ".join(risk.risk_factors) if risk.risk_factors else " None identified"
+        redacted_info = f"\n• Redacted PII: {', '.join(exp.redacted_categories)}" if exp.redacted_categories else ""
+
+        if risk.is_security_event:
+            header = "🛡️ [SECURITY EVENT - PROMPT INJECTION DETECTED]"
+            action_prompt = "⚠️ High-risk security event. Review the sanitized payload and confirm rejection or investigation."
+        else:
+            header = "🚨 [RISK ALERT] Expense Review Required"
+            action_prompt = "Please respond to approve or reject this expense."
 
         alert_message = (
-            f"🚨 [RISK ALERT] Expense Review Required\n"
+            f"{header}\n"
             f"• Submitter: {exp.submitter}\n"
             f"• Amount: ${exp.amount:.2f} (Threshold: ${config.AUTO_APPROVE_THRESHOLD:.2f})\n"
             f"• Category: {exp.category}\n"
             f"• Date: {exp.date}\n"
-            f"• Description: {exp.description}\n"
+            f"• Description (Sanitized): {exp.description}{redacted_info}\n"
             f"• Risk Level: {risk.risk_level}\n"
             f"• Risk Factors:{factors}\n"
             f"• Assessment: {risk.alert_summary}\n"
             f"• Recommendation: {risk.recommended_action}\n\n"
-            f"Please respond to approve or reject this expense."
+            f"{action_prompt}"
         )
 
         yield RequestInput(
@@ -241,46 +402,61 @@ async def human_approval(ctx: Context, node_input: ExpenseReview):
     human_response = ctx.resume_inputs[interrupt_id]
     status, notes = _parse_human_decision(human_response)
 
-    yield ExpenseOutcome(
-        expense=node_input.expense,
+    outcome = ExpenseOutcome(
+        expense=review.expense,
         status=status,
-        reason=f"Human review completed with decision: {status}.",
+        reason=(
+            f"Security review decision: {status}."
+            if review.risk_assessment.is_security_event
+            else f"Human review completed with decision: {status}."
+        ),
         reviewed_by="human_approver",
-        risk_alert=node_input.risk_assessment,
+        risk_alert=review.risk_assessment,
         approver_notes=notes,
+        is_security_event=review.risk_assessment.is_security_event,
     )
+    yield Event(output=outcome, state={"outcome": outcome.model_dump()})
 
 
-@node(name="record_outcome")
-def record_outcome(node_input: ExpenseOutcome) -> Event:
+def record_outcome(node_input: Any, ctx: Context | None = None) -> Event:
     """Final terminal node: logs outcome and emits user-facing content event."""
+    outcome = _resolve_input(node_input, ctx, ExpenseOutcome, "outcome")
+
     logger.info(
-        "Recorded final expense outcome: Submitter=%s, Amount=$%.2f, Status=%s, ReviewedBy=%s",
-        node_input.expense.submitter,
-        node_input.expense.amount,
-        node_input.status,
-        node_input.reviewed_by,
+        "Recorded final expense outcome: Submitter=%s, Amount=$%.2f, Status=%s, ReviewedBy=%s, SecurityEvent=%s",
+        outcome.expense.submitter,
+        outcome.expense.amount,
+        outcome.status,
+        outcome.reviewed_by,
+        outcome.is_security_event,
     )
+
+    security_badge = " [SECURITY FLAGGED]" if outcome.is_security_event else ""
+    pii_badge = f"\n- **Redacted PII**: {', '.join(outcome.expense.redacted_categories)}" if outcome.expense.redacted_categories else ""
 
     summary_text = (
-        f"📋 **Expense Report Outcome**\n\n"
-        f"- **Submitter**: {node_input.expense.submitter}\n"
-        f"- **Amount**: ${node_input.expense.amount:.2f}\n"
-        f"- **Category**: {node_input.expense.category}\n"
-        f"- **Status**: {'✅ ' if node_input.status == 'APPROVED' else '❌ '}{node_input.status}\n"
-        f"- **Reviewed By**: {node_input.reviewed_by}\n"
-        f"- **Details**: {node_input.reason}\n"
+        f"📋 **Expense Report Outcome**{security_badge}\n\n"
+        f"- **Submitter**: {outcome.expense.submitter}\n"
+        f"- **Amount**: ${outcome.expense.amount:.2f}\n"
+        f"- **Category**: {outcome.expense.category}\n"
+        f"- **Status**: {'✅ ' if outcome.status == 'APPROVED' else '❌ '}{outcome.status}\n"
+        f"- **Reviewed By**: {outcome.reviewed_by}\n"
+        f"- **Details**: {outcome.reason}{pii_badge}\n"
     )
-    if node_input.approver_notes:
-        summary_text += f"- **Approver Notes**: {node_input.approver_notes}\n"
+    if outcome.approver_notes:
+        summary_text += f"- **Approver Notes**: {outcome.approver_notes}\n"
 
     return Event(
-        output=node_input,
+        output=outcome,
         content=types.Content(
             role="model",
             parts=[types.Part.from_text(text=summary_text)],
         ),
     )
+
+
+# Explicitly wrap human_approval with rerun_on_resume=True
+human_approval_node = node(human_approval, name="human_approval", rerun_on_resume=True)
 
 
 # ------------------------------------------------------------------------------
@@ -291,7 +467,8 @@ root_agent = Workflow(
     name="ambient_expense_agent",
     description=(
         "Ambient expense-approval workflow using ADK 2.0 graph API with "
-        "deterministic routing, LLM risk review, and human-in-the-loop sign-off."
+        "deterministic routing, security checkpoint (PII scrubbing & prompt injection defense), "
+        "LLM risk review, and human-in-the-loop sign-off."
     ),
     edges=[
         ("START", parse_expense),
@@ -300,11 +477,18 @@ root_agent = Workflow(
             route_expense,
             {
                 "auto_approve": auto_approve,
-                "requires_review": review_risk,
+                "requires_review": security_checkpoint,
             },
         ),
-        (review_risk, human_approval),
-        (human_approval, record_outcome),
+        (
+            security_checkpoint,
+            {
+                "clean": review_risk,
+                "security_alert": human_approval_node,
+            },
+        ),
+        (review_risk, human_approval_node),
+        (human_approval_node, record_outcome),
         (auto_approve, record_outcome),
     ],
 )
