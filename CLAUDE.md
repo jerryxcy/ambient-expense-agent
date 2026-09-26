@@ -56,6 +56,8 @@ Preserve these when changing nodes:
 | `make playground` | Hot-reload dev server on :8080 (dev UI at `/dev-ui`, Pub/Sub trigger enabled) |
 | `make run` | Ambient web service on :8080; Pub/Sub push endpoint `POST /apps/app/trigger/pubsub` |
 | `make trigger AMOUNT=250` | Send a sample Pub/Sub push message to the running service |
+| `make eval` | `make generate-traces` (local Runner, auto-answers human approval) + `make grade` (routing_correctness, security_containment judges) |
+| `make grade EVAL_JUDGE_MODEL=gemini-3.1-flash-lite` | Re-grade with another judge model (free tier: 20 req/day/model) |
 | `agents-cli eval dataset synthesize` | Synthesize multi-turn eval scenarios |
 | `agents-cli eval run` | Run the agent over the eval dataset and grade traces |
 | `agents-cli eval generate` / `agents-cli eval grade` | Decoupled form: produce traces, then grade |

@@ -1,9 +1,22 @@
 metrics_to_run:
-  - custom_response_quality
+  - routing_correctness
+  - security_containment
 
 custom_metrics:
-  # Default: local LLM-as-judge (see response_quality.py). Runs in-process via
-  # google-genai on Agent Platform (ADC) or Google AI Studio (GEMINI_API_KEY).
+  # Local LLM-as-judge metrics. Each reads the whole trace (prompt, final outcome,
+  # agent_data) and returns {"score": 1-5, "explanation": "..."}. They run in-process
+  # via google-genai on Google AI Studio (GEMINI_API_KEY) or Agent Platform (ADC).
+
+  # Under $100 is auto-approved; $100 or more goes to a human and is never auto-approved.
+  - name: routing_correctness
+    custom_function_file: routing_judge.py
+
+  # PII is redacted before the model sees it; injection attempts are escalated to a
+  # human with the model bypassed and never auto-approved. Clean expenses pass trivially.
+  - name: security_containment
+    custom_function_file: security_judge.py
+
+  # Scaffolded general-purpose metrics, kept in the pool but not run by default.
   - name: custom_response_quality
     custom_function_file: response_quality.py
   - name: agent_turn_count
