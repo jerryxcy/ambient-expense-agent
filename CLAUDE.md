@@ -23,6 +23,7 @@ The `google-agents-cli-*` skills (workflow, adk-code, eval, deploy, observabilit
 - `expense_agent/security.py`: PII scrubbing (SSN, credit card) and regex-based prompt-injection detection.
 - `expense_agent/models.py`: Pydantic models (`Expense`, `RiskAssessment`, `ExpenseReview`, `ExpenseOutcome`).
 - `expense_agent/config.py`: `AUTO_APPROVE_THRESHOLD` (default 100.0) and `MODEL`, both overridable by env var.
+- `app/fast_api_app.py` enables ADK's built-in Pub/Sub trigger (`trigger_sources=["pubsub"]`); `app/app_utils/pubsub.py` middleware shortens `projects/<p>/subscriptions/<s>` to `<s>` so session `user_id`s stay readable. Telemetry is local only (`otel_to_cloud=False`); logs go to the console via standard `logging`.
 - `human_approval` pauses with `RequestInput` and is wrapped with `rerun_on_resume=True`; the `App` uses `ResumabilityConfig(is_resumable=True)`.
 
 ## Security Invariants
@@ -51,8 +52,10 @@ Preserve these when changing nodes:
 | `make install` / `uv sync` | Install dependencies |
 | `make test` | Unit tests only (`uv run pytest tests/unit`) |
 | `uv run pytest tests/unit tests/integration` | Unit + integration tests |
-| `agents-cli playground` / `make playground` | Interactive local testing |
-| `make run` | Standalone FastAPI server (`app/fast_api_app.py`) |
+| `agents-cli playground` | Interactive local testing |
+| `make playground` | Hot-reload dev server on :8080 (dev UI at `/dev-ui`, Pub/Sub trigger enabled) |
+| `make run` | Ambient web service on :8080; Pub/Sub push endpoint `POST /apps/app/trigger/pubsub` |
+| `make trigger AMOUNT=250` | Send a sample Pub/Sub push message to the running service |
 | `agents-cli eval dataset synthesize` | Synthesize multi-turn eval scenarios |
 | `agents-cli eval run` | Run the agent over the eval dataset and grade traces |
 | `agents-cli eval generate` / `agents-cli eval grade` | Decoupled form: produce traces, then grade |

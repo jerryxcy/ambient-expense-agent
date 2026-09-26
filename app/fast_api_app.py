@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import contextlib
+import logging
 import os
 from collections.abc import AsyncIterator
 
@@ -24,17 +25,23 @@ from google.adk.runners import Runner
 
 from app.app_utils import services
 from app.app_utils.a2a import attach_a2a_routes
+from app.app_utils.pubsub import PubSubSubscriptionMiddleware
 from app.app_utils.reasoning_engine_adapter import (
     attach_reasoning_engine_routes,
 )
 
 load_dotenv()
+
+# Console logging via the standard library; no Cloud Logging client.
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
+
 allow_origins = (
     os.getenv("ALLOW_ORIGINS", "").split(",") if os.getenv("ALLOW_ORIGINS") else None
 )
-otel_to_cloud = os.environ.get(
-    "GOOGLE_CLOUD_AGENT_ENGINE_ENABLE_TELEMETRY", ""
-).lower() in ("true", "1")
 
 AGENT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -68,9 +75,15 @@ app: FastAPI = get_fast_api_app(
     artifact_service_uri=services.ARTIFACT_SERVICE_URI,
     allow_origins=allow_origins,
     session_service_uri=services.SESSION_SERVICE_URI,
-    otel_to_cloud=otel_to_cloud,
+    # Telemetry stays local: no traces or logs are exported to Google Cloud.
+    otel_to_cloud=False,
+    # Ambient mode: registers POST /apps/{app_name}/trigger/pubsub, which decodes
+    # each push message and runs it through the workflow in a fresh session.
+    trigger_sources=["pubsub"],
     lifespan=lifespan,
 )
+# Shorten projects/<p>/subscriptions/<s> to <s> before ADK derives the session user_id.
+app.add_middleware(PubSubSubscriptionMiddleware)
 app.title = "ambient-expense-agent"
 app.description = "API for interacting with the Agent ambient-expense-agent"
 
@@ -83,4 +96,6 @@ attach_reasoning_engine_routes(app)
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    port = int(os.getenv("PORT", "8080"))
+    logger.info("Serving Pub/Sub trigger at http://localhost:%d/apps/app/trigger/pubsub", port)
+    uvicorn.run(app, host="0.0.0.0", port=port)
